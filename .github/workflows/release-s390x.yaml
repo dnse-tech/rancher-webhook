@@ -129,50 +129,31 @@ jobs:
           echo "arm64_digest=$HAS_ARM64" >> $GITHUB_OUTPUT
           echo "Upstream images verified: amd64=$HAS_AMD64, arm64=$HAS_ARM64"
 
-      - name: Pull and retag upstream images
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push multi-arch manifest
         run: |
           set -e
           TAG=${{ needs.build-s390x.outputs.version }}
           UPSTREAM="${{ env.UPSTREAM_IMAGE }}:${TAG}"
           TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
 
-          # Pull upstream amd64
-          docker pull --platform linux/amd64 "$UPSTREAM" || { echo "::error::Failed to pull amd64"; exit 1; }
-          docker tag "$UPSTREAM" "${TARGET}:${TAG}-amd64"
-          docker push "${TARGET}:${TAG}-amd64" || { echo "::error::Failed to push amd64"; exit 1; }
-
-          # Pull upstream arm64
-          docker pull --platform linux/arm64 "$UPSTREAM" || { echo "::error::Failed to pull arm64"; exit 1; }
-          docker tag "$UPSTREAM" "${TARGET}:${TAG}-arm64"
-          docker push "${TARGET}:${TAG}-arm64" || { echo "::error::Failed to push arm64"; exit 1; }
-
-      - name: Create and push multi-arch manifest
-        run: |
-          set -e
-          TAG=${{ needs.build-s390x.outputs.version }}
-          TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-
           echo "Creating multi-arch manifest for $TARGET:$TAG"
-          docker manifest create "${TARGET}:${TAG}" \
-            "${TARGET}:${TAG}-amd64" \
-            "${TARGET}:${TAG}-arm64" \
+          echo "Combining: upstream amd64/arm64 + our s390x"
+
+          # Use buildx imagetools to combine manifest lists
+          docker buildx imagetools create -t "${TARGET}:${TAG}" \
+            "${UPSTREAM}" \
             "${TARGET}:${TAG}-s390x" || { echo "::error::Failed to create manifest"; exit 1; }
 
-          # Annotate architectures
-          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-amd64" --arch amd64 --os linux || exit 1
-          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-arm64" --arch arm64 --os linux || exit 1
-          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-s390x" --arch s390x --os linux || exit 1
-
-          echo "Pushing manifest..."
-          docker manifest push "${TARGET}:${TAG}" || { echo "::error::Failed to push manifest"; exit 1; }
-
           echo "Multi-arch manifest pushed: ${TARGET}:${TAG}"
-          echo "Architectures: amd64, arm64, s390x"
 
       - name: Verify manifest
         run: |
+          set -e
           TAG=${{ needs.build-s390x.outputs.version }}
           TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
 
           echo "Verifying manifest for $TARGET"
-          docker manifest inspect "$TARGET"
+          docker buildx imagetools inspect "$TARGET"
