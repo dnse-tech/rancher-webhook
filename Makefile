@@ -4,6 +4,8 @@ ifeq ($(UNAME_ARCH),x86_64)
     ARCH ?= amd64
 else ifeq ($(UNAME_ARCH),aarch64)
     ARCH ?= arm64
+else ifeq ($(UNAME_ARCH),s390x)
+    ARCH ?= s390x
 else
     ARCH ?= $(UNAME_ARCH)
 endif

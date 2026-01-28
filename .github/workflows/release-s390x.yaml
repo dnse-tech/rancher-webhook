@@ -1,0 +1,175 @@
+name: Build s390x and Multi-Arch Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (e.g., v0.6.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/rancher-webhook
+  UPSTREAM_IMAGE: rancher/rancher-webhook
+
+jobs:
+  build-s390x:
+    name: Build s390x image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.tag }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: s390x
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract version info
+        id: vars
+        run: |
+          source scripts/version
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "commit=${COMMIT}" >> $GITHUB_OUTPUT
+
+      - name: Build and push s390x image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: package/Dockerfile
+          platforms: linux/s390x
+          push: true
+          build-args: |
+            VERSION=${{ steps.vars.outputs.version }}
+            COMMIT=${{ steps.vars.outputs.commit }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}-s390x
+
+  create-manifest:
+    name: Create multi-arch manifest
+    runs-on: ubuntu-latest
+    needs: build-s390x
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (read-only for pulling)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Check upstream images exist
+        id: check
+        run: |
+          set -e
+          TAG=${{ needs.build-s390x.outputs.version }}
+          UPSTREAM="${{ env.UPSTREAM_IMAGE }}:${TAG}"
+
+          echo "Checking for upstream image: $UPSTREAM"
+
+          # Check if upstream image exists and has required architectures
+          if ! docker manifest inspect "$UPSTREAM" > /dev/null 2>&1; then
+            echo "::error::Upstream image $UPSTREAM not found on Docker Hub."
+            echo "::error::The upstream rancher/webhook release may not have been published yet."
+            echo "::error::Please wait for upstream release or check the tag name."
+            exit 1
+          fi
+
+          # Verify amd64 and arm64 are present
+          MANIFEST=$(docker manifest inspect "$UPSTREAM")
+          HAS_AMD64=$(echo "$MANIFEST" | jq -r '.manifests[]? | select(.platform.architecture=="amd64") | .digest' | head -1)
+          HAS_ARM64=$(echo "$MANIFEST" | jq -r '.manifests[]? | select(.platform.architecture=="arm64") | .digest' | head -1)
+
+          if [ -z "$HAS_AMD64" ] || [ -z "$HAS_ARM64" ]; then
+            echo "::error::Missing required architectures: amd64=$HAS_AMD64, arm64=$HAS_ARM64"
+            exit 1
+          fi
+
+          echo "amd64_digest=$HAS_AMD64" >> $GITHUB_OUTPUT
+          echo "arm64_digest=$HAS_ARM64" >> $GITHUB_OUTPUT
+          echo "Upstream images verified: amd64=$HAS_AMD64, arm64=$HAS_ARM64"
+
+      - name: Pull and retag upstream images
+        run: |
+          set -e
+          TAG=${{ needs.build-s390x.outputs.version }}
+          UPSTREAM="${{ env.UPSTREAM_IMAGE }}:${TAG}"
+          TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          # Pull upstream amd64
+          docker pull --platform linux/amd64 "$UPSTREAM" || { echo "::error::Failed to pull amd64"; exit 1; }
+          docker tag "$UPSTREAM" "${TARGET}:${TAG}-amd64"
+          docker push "${TARGET}:${TAG}-amd64" || { echo "::error::Failed to push amd64"; exit 1; }
+
+          # Pull upstream arm64
+          docker pull --platform linux/arm64 "$UPSTREAM" || { echo "::error::Failed to pull arm64"; exit 1; }
+          docker tag "$UPSTREAM" "${TARGET}:${TAG}-arm64"
+          docker push "${TARGET}:${TAG}-arm64" || { echo "::error::Failed to push arm64"; exit 1; }
+
+      - name: Create and push multi-arch manifest
+        run: |
+          set -e
+          TAG=${{ needs.build-s390x.outputs.version }}
+          TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          echo "Creating multi-arch manifest for $TARGET:$TAG"
+          docker manifest create "${TARGET}:${TAG}" \
+            "${TARGET}:${TAG}-amd64" \
+            "${TARGET}:${TAG}-arm64" \
+            "${TARGET}:${TAG}-s390x" || { echo "::error::Failed to create manifest"; exit 1; }
+
+          # Annotate architectures
+          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-amd64" --arch amd64 --os linux || exit 1
+          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-arm64" --arch arm64 --os linux || exit 1
+          docker manifest annotate "${TARGET}:${TAG}" "${TARGET}:${TAG}-s390x" --arch s390x --os linux || exit 1
+
+          echo "Pushing manifest..."
+          docker manifest push "${TARGET}:${TAG}" || { echo "::error::Failed to push manifest"; exit 1; }
+
+          echo "Multi-arch manifest pushed: ${TARGET}:${TAG}"
+          echo "Architectures: amd64, arm64, s390x"
+
+      - name: Verify manifest
+        run: |
+          TAG=${{ needs.build-s390x.outputs.version }}
+          TARGET="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}"
+
+          echo "Verifying manifest for $TARGET"
+          docker manifest inspect "$TARGET"

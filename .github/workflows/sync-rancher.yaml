@@ -1,0 +1,94 @@
+name: Sync Upstream Releases
+
+on:
+  schedule:
+    # Daily at 17:00 UTC
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: rancher/webhook
+
+jobs:
+  sync:
+    name: Sync upstream releases
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          LATEST_TAG=$(curl -s -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" | jq -r '.tag_name // empty')
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "::warning::No upstream release found"
+            echo "has_new_release=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag: $LATEST_TAG"
+
+          # Check if we already have this tag
+          if git rev-parse "$LATEST_TAG" >/dev/null 2>&1; then
+            echo "Tag $LATEST_TAG already exists locally"
+            echo "has_new_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "New release found: $LATEST_TAG"
+            echo "has_new_release=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fetch upstream and create tag
+        if: steps.upstream.outputs.has_new_release == 'true'
+        run: |
+          set -e
+          TAG=${{ steps.upstream.outputs.latest_tag }}
+
+          # Add upstream remote
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git 2>/dev/null || true
+          echo "Fetching upstream tags for $TAG..."
+          git fetch upstream --tags || { echo "::error::Failed to fetch upstream tags"; exit 1; }
+
+          # Verify tag exists in upstream
+          if ! git rev-parse "refs/tags/$TAG" &>/dev/null; then
+            echo "::error::Tag $TAG not found in upstream"
+            exit 1
+          fi
+
+          # Get the commit for this tag from upstream
+          COMMIT=$(git rev-list -n 1 "refs/tags/$TAG")
+
+          # Create the tag pointing to the same commit
+          git tag "$TAG" "$COMMIT" -m "Synced from upstream ${{ env.UPSTREAM_REPO }}" || {
+            echo "Tag may already exist locally, verifying..."
+            git rev-parse "$TAG" || exit 1
+          }
+          git push origin "$TAG" || { echo "::error::Failed to push tag to origin"; exit 1; }
+
+          echo "Created and pushed tag: $TAG"
+
+      - name: Create GitHub Release
+        if: steps.upstream.outputs.has_new_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.upstream.outputs.latest_tag }}
+          name: ${{ steps.upstream.outputs.latest_tag }}
+          body: |
+            Synced from upstream [rancher/webhook](https://github.com/rancher/webhook/releases/tag/${{ steps.upstream.outputs.latest_tag }})
+
+            This release adds s390x architecture support to the multi-arch image.
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
